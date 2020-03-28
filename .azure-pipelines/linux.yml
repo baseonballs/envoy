@@ -1,146 +1,146 @@
 trigger:
   branches:
     include:
-    - 'master'
+      - "master"
   tags:
     include:
-    - 'v*'
+      - "v*"
 
 # PR build config is manually overridden in Azure pipelines UI with different secrets
 pr: none
 
 jobs:
-- job: format
-  dependsOn: [] # this removes the implicit dependency on previous stage and causes this to run in parallel.
-  pool:
-    vmImage: 'Ubuntu 16.04'
-  steps:
-  - task: CacheBeta@1
-    inputs:
-      key: 'format | ./WORKSPACE | **/*.bzl'
-      path: $(Build.StagingDirectory)/repository_cache
+  - job: format
+    dependsOn: [] # this removes the implicit dependency on previous stage and causes this to run in parallel.
+    pool:
+      vmImage: "ubuntu-16.04"
+    steps:
+      - task: CacheBeta@1
+        inputs:
+          key: "format | ./WORKSPACE | **/*.bzl"
+          path: $(Build.StagingDirectory)/repository_cache
 
-  - script: ci/run_envoy_docker.sh 'ci/check_and_fix_format.sh'
-    workingDirectory: $(Build.SourcesDirectory)
-    env:
-      ENVOY_DOCKER_BUILD_DIR: $(Build.StagingDirectory)
-      BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
-      BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
-      GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
-    displayName: "Run check format scripts"
+      - script: ci/run_envoy_docker.sh 'ci/check_and_fix_format.sh'
+        workingDirectory: $(Build.SourcesDirectory)
+        env:
+          ENVOY_DOCKER_BUILD_DIR: $(Build.StagingDirectory)
+          BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
+          BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
+          GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
+        displayName: "Run check format scripts"
 
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathtoPublish: "$(Build.StagingDirectory)/fix_format.diff"
-      artifactName: format
-    condition: failed()
+      - task: PublishBuildArtifacts@1
+        inputs:
+          pathtoPublish: "$(Build.StagingDirectory)/fix_format.diff"
+          artifactName: format
+        condition: failed()
 
-- job: bazel
-  dependsOn: ["format"]
-  # For master builds, continue even if format fails
-  condition: and(not(canceled()), or(succeeded(), ne(variables['Build.Reason'], 'PullRequest')))
-  strategy:
-    maxParallel: 3
-    matrix:
-      gcc:
-        CI_TARGET: 'bazel.gcc'
-      clang_tidy:
-        CI_TARGET: 'bazel.clang_tidy'
-      asan:
-        CI_TARGET: 'bazel.asan'
-      tsan:
-        CI_TARGET: 'bazel.tsan'
-      compile_time_options:
-        CI_TARGET: 'bazel.compile_time_options'
-      release:
-        CI_TARGET: 'bazel.release'
-  timeoutInMinutes: 360
-  pool:
-    vmImage: 'Ubuntu 16.04'
-  steps:
-  - task: CacheBeta@1
-    inputs:
-      key: '"$(CI_TARGET)" | ./WORKSPACE | **/*.bzl'
-      path: $(Build.StagingDirectory)/repository_cache
+  - job: release
+    displayName: "Linux-x64 release"
+    dependsOn: ["format"]
+    # For master builds, continue even if format fails
+    condition: and(not(canceled()), or(succeeded(), ne(variables['Build.Reason'], 'PullRequest')))
+    pool:
+      vmImage: "ubuntu-16.04"
+    steps:
+      - template: bazel.yml
+        parameters:
+          ciTarget: bazel.release
 
-  - bash: |
-      echo "disk space at beginning of build:"
-      df -h
-    displayName: "Check disk space at beginning"
+  - job: bazel
+    displayName: "Linux-x64 Bazel"
+    dependsOn: ["release"]
+    # For master builds, continue even if format fails
+    condition: and(not(canceled()), or(succeeded(), ne(variables['Build.Reason'], 'PullRequest')))
+    strategy:
+      maxParallel: 3
+      matrix:
+        gcc:
+          CI_TARGET: "bazel.gcc"
+        clang_tidy:
+          CI_TARGET: "bazel.clang_tidy"
+        asan:
+          CI_TARGET: "bazel.asan"
+        tsan:
+          CI_TARGET: "bazel.tsan"
+        compile_time_options:
+          CI_TARGET: "bazel.compile_time_options"
+        release:
+          CI_TARGET: "bazel.release"
+    timeoutInMinutes: 360
+    pool:
+      vmImage: "Ubuntu 16.04"
+    steps:
+      - template: bazel.yml
+        parameters:
+          ciTarget: $(CI_TARGET)
 
-  - bash: |
-      sudo mkdir -p /etc/docker
-      echo '{
-        "ipv6": true,
-        "fixed-cidr-v6": "2001:db8:1::/64"
-      }' | sudo tee /etc/docker/daemon.json
-      sudo service docker restart
-    displayName: "Enable IPv6"
+  - job: docker
+    displayName: "Linux-x64 Docker"
+    dependsOn: ["release"]
+    condition: and(succeeded(), eq(variables['PostSubmit'], 'true'), ne(variables['Build.Reason'], 'PullRequest'))
+    pool:
+      vmImage: "ubuntu-16.04"
+    steps:
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: current
+          artifactName: "bazel.release"
+          itemPattern: "bazel.release/envoy_binary.tar.gz"
+          downloadType: single
+          targetPath: $(Build.StagingDirectory)
 
-  - script: ci/run_envoy_docker.sh 'ci/do_ci.sh $(CI_TARGET)'
-    workingDirectory: $(Build.SourcesDirectory)
-    env:
-      ENVOY_DOCKER_BUILD_DIR: $(Build.StagingDirectory)
-      ENVOY_RBE: "true"
-      BAZEL_BUILD_EXTRA_OPTIONS: "--config=remote-ci --jobs=$(RbeJobs) --curses=no"
-      BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
-      BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
-      GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
-    displayName: "Run CI script"
+      - bash: |
+          set -e
+          tar zxf $(Build.StagingDirectory)/bazel.release/envoy_binary.tar.gz
+          ci/docker_build.sh
+          ci/docker_push.sh
+          ci/docker_tag.sh
+        workingDirectory: $(Build.SourcesDirectory)
+        env:
+          AZP_BRANCH: $(Build.SourceBranch)
+          CIRCLE_SHA1: $(Build.SourceVersion)
+          DOCKERHUB_USERNAME: $(DockerUsername)
+          DOCKERHUB_PASSWORD: $(DockerPassword)
 
-  - bash: |
-      echo "disk space at end of build:"
-      df -h
-    displayName: "Check disk space at end"
-    condition: always()
+  - job: macOS
+    dependsOn: ["format"]
+    timeoutInMinutes: 360
+    pool:
+      vmImage: "macos-latest"
+    steps:
+      - script: ./ci/mac_ci_setup.sh
+        displayName: "Install dependencies"
 
-  - task: PublishTestResults@2
-    inputs:
-      testResultsFiles: '**/bazel-out/**/testlogs/**/test.xml'
-      testRunTitle: '$(CI_TARGET)'
-      searchFolder: $(Build.StagingDirectory)/tmp
-    condition: always()
+      - script: ./ci/mac_ci_steps.sh
+        displayName: "Run Mac CI"
+        env:
+          BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
+          BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
+          GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
 
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathtoPublish: "$(Build.StagingDirectory)/envoy"
-      artifactName: $(CI_TARGET)
-    condition: always()
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFiles: "**/bazel-testlogs/**/test.xml"
+          testRunTitle: "macOS"
+        condition: always()
 
-  # https://stackoverflow.com/questions/57466218/is-an-azure-devops-build-pipeline-is-there-a-way-to-cancel-one-pipeline-job-fro
-  - powershell: |
-      $url = "$($env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI)$env:SYSTEM_TEAMPROJECTID/_apis/build/builds/$($env:BUILD_BUILDID)?api-version=2.0"
-      $header = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN"  }
-      $body = @{ 'status'='Cancelling' } | ConvertTo-Json
-      Invoke-RestMethod -Uri $url -Method Patch -Body $body -Headers $header -ContentType application/json
-    displayName: Cancel the pipeline
-    env:
-      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-    condition: and(failed(), eq(variables['Build.Reason'], 'PullRequest'))
+  - job: Windows
+    dependsOn: ["format"]
+    timeoutInMinutes: 360
+    pool:
+      vmImage: "windows-latest"
+    steps:
+      - powershell: |
+          .\ci\windows_ci_setup.ps1
+          Write-Host "##vso[task.prependpath]$env:TOOLS_BIN_DIR"
+        displayName: "Install dependencies"
+        env:
+          TOOLS_BIN_DIR: $(Pipeline.Workspace)\bin
 
-- job: docker
-  dependsOn: ["bazel"]
-  condition: and(succeeded(), eq(variables['PostSubmit'], 'true'), ne(variables['Build.Reason'], 'PullRequest'))
-  pool:
-    vmImage: 'Ubuntu 16.04'
-  steps:
-  - task: DownloadBuildArtifacts@0
-    inputs:
-      buildType: current
-      artifactName: "bazel.release"
-      itemPattern: "bazel.release/envoy_binary.tar.gz"
-      downloadType: single
-      targetPath: $(Build.StagingDirectory)
-
-  - bash: |
-      set -e
-      tar zxf $(Build.StagingDirectory)/bazel.release/envoy_binary.tar.gz
-      ci/docker_build.sh
-      ci/docker_push.sh
-      ci/docker_tag.sh
-    workingDirectory: $(Build.SourcesDirectory)
-    env:
-      AZP_BRANCH: $(Build.SourceBranch)
-      CIRCLE_SHA1: $(Build.SourceVersion)
-      DOCKERHUB_USERNAME: $(DockerUsername)
-      DOCKERHUB_PASSWORD: $(DockerPassword)
+      - bash: ci/windows_ci_steps.sh
+        displayName: "Run Windows CI"
+        env:
+          TMPDIR: $(Agent.TempDirectory)
+          BAZEL_VC: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC"
+          BAZEL_SH: "C:\\Program Files\\Git\\bin\\bash.exe"
